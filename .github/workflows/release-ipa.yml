@@ -1,117 +1,495 @@
 name: Build IPA
 
 on:
-  workflow_dispatch:
+  pull_request:
+    branches: [main]
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Hosted runner (use Intel if ARM capacity is unavailable)"
+        type: choice
+        default: macos-26
+        options: [macos-26-intel, macos-26]
+      inspect_run_id:
+        description: "Optional: export diagnostics from an existing validation artifact instead of rebuilding"
+        type: string
+        required: false
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  # Explicit retries must not wait for a cancelled hosted runner to release its lock.
+  group: ipa-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'build' }}
+  cancel-in-progress: true
 
 env:
   PROJECT: ScreenTranslate.xcodeproj
   SCHEME: ScreenTranslate
   APP_NAME: ScreenTranslate
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
 
 jobs:
-  build:
-    name: Build unsigned IPA
-    runs-on: macos-26-intel
-
+  inspect:
+    if: inputs.inspect_run_id != ''
+    name: Inspect existing iOS test diagnostics
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.inspect_run_id }}
+          pattern: validation-${{ inputs.inspect_run_id }}-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/previous-validation
+      - name: Export diagnostics and test summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import os, subprocess
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          bundle = next((root / 'previous-validation').rglob('TestResults.xcresult'))
+          subprocess.run(['xcrun', 'xcresulttool', 'export', 'diagnostics', '--path', str(bundle), '--output-path', str(root / 'exported-diagnostics')], check=True)
+          for kind in ['summary', 'tests']:
+              output = subprocess.check_output(['xcrun', 'xcresulttool', 'get', 'test-results', kind, '--path', str(bundle)])
+              (root / ('inspection-' + kind + '.json')).write_bytes(output)
+          predicate = 'process == "ScreenTranslateShare" OR process == "ScreenTranslate" OR eventMessage CONTAINS[c] "gesture gate" OR eventMessage CONTAINS[c] "com.bahaanajjar.ScreenTranslate.ShareExtension"'
+          for index, archive in enumerate((root / 'exported-diagnostics').rglob('*.logarchive')):
+              try:
+                  output = subprocess.check_output(['log', 'show', '--archive', str(archive), '--style', 'compact', '--info', '--debug', '--predicate', predicate], timeout=90)
+                  (root / ('inspection-system-' + str(index) + '.log')).write_bytes(output)
+              except subprocess.SubprocessError as error:
+                  print('::warning::Could not decode one unified log archive:', error)
+          PYTHON
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: inspection-${{ inputs.inspect_run_id }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/exported-diagnostics
+            ${{ runner.temp }}/inspection-*.json
+            ${{ runner.temp }}/inspection-*.log
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Select Xcode 26.6
-        run: sudo xcode-select --switch /Applications/Xcode_26.6.app/Contents/Developer
+  build:
+    if: inputs.inspect_run_id == ''
+    name: Test and build unsigned IPA
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      ipa_name: ${{ steps.metadata.outputs.ipa_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check runner and SDK prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -m
+          sysctl hw.memsize
+          df -h "$RUNNER_TEMP"
+          if [[ ! -d "$DEVELOPER_DIR" ]]; then
+            echo "::error::Runner image is missing Xcode 26.6. This is a toolchain prerequisite failure."
+            exit 1
+          fi
+          xcodebuild -version
+          xcodebuild -showsdks
+          swift --version
+
+      - name: Test shared production core
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test --jobs 3 2>&1 | tee "$RUNNER_TEMP/core-tests.log"
+
+      - name: Upload OCR timing and core regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ocr-core-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/core-tests.log
+            ${{ runner.temp }}/vision-core
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Verify bundled Shortcut signature and actions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify-bundled-shortcut.py | tee "$RUNNER_TEMP/shortcut-verification.json"
 
       - name: Resolve version and artifact name
         id: metadata
         shell: bash
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            VERSION="${GITHUB_REF_NAME#v}"
-          else
-            VERSION="$(
-              xcodebuild \
-                -project "$PROJECT" \
-                -scheme "$SCHEME" \
-                -showBuildSettings |
-              awk '/MARKETING_VERSION/ { print $3; exit }'
-            )"
-          fi
-
-          if [[ -z "$VERSION" ]]; then
-            echo "Could not determine the app version." >&2
+          set -euo pipefail
+          xcodebuild -project "$PROJECT" -scheme "$SCHEME" -showBuildSettings -json > "$RUNNER_TEMP/build-settings.json"
+          VERSION="$(python3 -c 'import json,sys; print(next(t["buildSettings"]["MARKETING_VERSION"] for t in json.load(sys.stdin) if t["target"] == "ScreenTranslate"))' < "$RUNNER_TEMP/build-settings.json")"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; fi
+          if [[ ! "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]]; then
+            echo "::error::Invalid app version. Use a numeric version such as 1.0.0."
             exit 1
           fi
-
           IPA_NAME="TranslateScreen-$VERSION-unsigned.ipa"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "IPA_NAME=$IPA_NAME" >> "$GITHUB_ENV"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "ipa_name=$IPA_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Build release app
-        run: |
-          xcodebuild clean build \
-            -project "$PROJECT" \
-            -scheme "$SCHEME" \
-            -configuration Release \
-            -sdk iphoneos \
-            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            MARKETING_VERSION="$VERSION"
-
-      - name: Package IPA
+      - name: Build release app without signing
         shell: bash
         run: |
+          set -euo pipefail
+          xcodebuild build -project "$PROJECT" -scheme "$SCHEME" \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -jobs 3 \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -resultBundlePath "$RUNNER_TEMP/BuildResults.xcresult" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            COMPILER_INDEX_STORE_ENABLE=NO MARKETING_VERSION="$VERSION" \
+            2>&1 | tee "$RUNNER_TEMP/ios-build.log"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
           APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/$APP_NAME.app"
-          PACKAGE_PATH="$RUNNER_TEMP/ipa-package"
-
-          if [[ ! -d "$APP_PATH" ]]; then
-            echo "Built application was not found at $APP_PATH" >&2
-            exit 1
-          fi
-
-          mkdir -p "$PACKAGE_PATH/Payload"
-          cp -R "$APP_PATH" "$PACKAGE_PATH/Payload/"
-
-          (
-            cd "$PACKAGE_PATH"
-            COPYFILE_DISABLE=1 zip -qry "$GITHUB_WORKSPACE/$IPA_NAME" Payload
-          )
-
+          test -d "$APP_PATH"
+          python3 .github/scripts/verify-bundled-shortcut.py --app "$APP_PATH" | tee "$RUNNER_TEMP/shortcut-package-verification.json"
+          mkdir -p "$RUNNER_TEMP/ipa-package/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/ipa-package/Payload/"
+          (cd "$RUNNER_TEMP/ipa-package" && COPYFILE_DISABLE=1 zip -qry "$GITHUB_WORKSPACE/$IPA_NAME" Payload)
+          unzip -t "$IPA_NAME"
           shasum -a 256 "$IPA_NAME" > "$IPA_NAME.sha256"
+          echo "### Unsigned IPA" >> "$GITHUB_STEP_SUMMARY"
+          echo "Download TranslateScreen-$VERSION-unsigned from this run's Artifacts. It contains $IPA_NAME and its SHA-256 checksum. Sign it yourself before installing on a physical iPhone." >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload workflow artifact
+      - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: TranslateScreen-${{ steps.metadata.outputs.version }}-unsigned
           path: |
-            ${{ steps.metadata.outputs.ipa_name }}
-            ${{ steps.metadata.outputs.ipa_name }}.sha256
+            ${{ env.IPA_NAME }}
+            ${{ env.IPA_NAME }}.sha256
           if-no-files-found: error
+          retention-days: 14
 
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Choose an available iOS simulator
+        id: simulator
         shell: bash
         run: |
-          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" \
-              "$IPA_NAME" \
-              "$IPA_NAME.sha256" \
-              --clobber
+          set -euo pipefail
+          xcrun simctl list devices available --json > "$RUNNER_TEMP/simulators.json"
+          DESTINATION="$(python3 .github/scripts/simulator-destination.py < "$RUNNER_TEMP/simulators.json")"
+          echo "destination=$DESTINATION" >> "$GITHUB_OUTPUT"
+
+      - name: Compile iOS app and hosted tests
+        env:
+          TEST_DESTINATION: ${{ steps.simulator.outputs.destination }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild build-for-testing -project "$PROJECT" -scheme "$SCHEME" \
+            -configuration Debug -destination "$TEST_DESTINATION" -destination-timeout 180 \
+            -parallel-testing-enabled NO -jobs 3 \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -resultBundlePath "$RUNNER_TEMP/TestBuild.xcresult" \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM="" \
+            2>&1 | tee "$RUNNER_TEMP/ios-test-build.log"
+
+      - name: Boot the selected iPhone before measuring test time
+        timeout-minutes: 15
+        env:
+          TEST_DESTINATION: ${{ steps.simulator.outputs.destination }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          UDID="${TEST_DESTINATION##*id=}"
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Test iOS workflow, Vision and Keychain
+        timeout-minutes: 15
+        id: hosted_tests
+        env:
+          TEST_DESTINATION: ${{ steps.simulator.outputs.destination }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild test-without-building -project "$PROJECT" -scheme "$SCHEME" \
+            -configuration Debug -destination "$TEST_DESTINATION" -destination-timeout 180 \
+            -parallel-testing-enabled NO -jobs 3 \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -resultBundlePath "$RUNNER_TEMP/HostedResults.xcresult" \
+            -only-testing:ScreenTranslateTests \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 180 \
+            -maximum-test-execution-time-allowance 300 \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM="" \
+            2>&1 | tee "$RUNNER_TEMP/ios-tests.log"
+
+      - name: Export hosted rendering screenshots
+        if: always()
+        shell: bash
+        run: |
+          if [[ -d "$RUNNER_TEMP/HostedResults.xcresult" ]]; then
+            xcrun xcresulttool export attachments \
+              --path "$RUNNER_TEMP/HostedResults.xcresult" \
+              --output-path "$RUNNER_TEMP/hosted-screenshots" \
+              || echo "::warning::Hosted test attachments remain in their result bundle."
+          fi
+
+      - name: Upload native rendering evidence before UI automation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-rendering-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ios-tests.log
+            ${{ runner.temp }}/HostedResults.xcresult
+            ${{ runner.temp }}/hosted-screenshots
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Restart simulator services before UI automation
+        if: ${{ !cancelled() && steps.hosted_tests.outcome != 'skipped' }}
+        timeout-minutes: 10
+        env:
+          TEST_DESTINATION: ${{ steps.simulator.outputs.destination }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Hosted tests create and dismiss multiple UIWindows. Start UI
+          # automation with fresh SpringBoard/Accessibility services while
+          # retaining the installed build and diagnostic results.
+          UDID="${TEST_DESTINATION##*id=}"
+          xcrun simctl shutdown "$UDID"
+          xcrun simctl bootstatus "$UDID" -b
+
+      - name: Test the real system Share interface and adaptive UI
+        if: ${{ !cancelled() && steps.hosted_tests.outcome != 'skipped' }}
+        timeout-minutes: 20
+        env:
+          TEST_DESTINATION: ${{ steps.simulator.outputs.destination }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild test-without-building -project "$PROJECT" -scheme "$SCHEME" \
+            -configuration Debug -destination "$TEST_DESTINATION" -destination-timeout 180 \
+            -parallel-testing-enabled NO -jobs 3 \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -resultBundlePath "$RUNNER_TEMP/TestResults.xcresult" \
+            -only-testing:ScreenTranslateUITests \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 180 \
+            -maximum-test-execution-time-allowance 600 \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM="" \
+            2>&1 | tee "$RUNNER_TEMP/ios-ui-tests.log"
+
+      - name: Export local processing stages
+        if: always() && steps.simulator.outputs.destination != ''
+        env:
+          TEST_DESTINATION: ${{ steps.simulator.outputs.destination }}
+        shell: bash
+        run: |
+          UDID="${TEST_DESTINATION##*id=}"
+          python3 .github/scripts/export-simulator-processing.py "$HOME/Library/Developer/CoreSimulator/Devices/$UDID/data/Containers" | tee "$RUNNER_TEMP/processing-stages.json"
+
+      - name: Export interface review screenshots
+        if: always()
+        shell: bash
+        run: |
+          if [[ -d "$RUNNER_TEMP/TestResults.xcresult" ]]; then
+            xcrun xcresulttool export attachments \
+              --path "$RUNNER_TEMP/TestResults.xcresult" \
+              --output-path "$RUNNER_TEMP/interface-screenshots" \
+              || echo "::warning::Screenshot export failed; attachments remain in the test result bundle."
+          fi
+      - name: Verify Share UI completed every interaction
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify-share-ui-report.py "$RUNNER_TEMP/interface-screenshots" | tee "$RUNNER_TEMP/share-ui-completion.json"
+
+      - name: Record Shortcuts simulator coverage
+        if: always() && steps.simulator.outputs.destination != ''
+        env:
+          TEST_DESTINATION: ${{ steps.simulator.outputs.destination }}
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, subprocess
+          from pathlib import Path
+          udid = os.environ["TEST_DESTINATION"].split("id=", 1)[1]
+          report = {"testedHost": "UIActivityViewController", "shortcutsEndToEndTested": False}
+          try:
+              result = subprocess.run(["xcrun", "simctl", "listapps", udid], capture_output=True, text=True, timeout=45)
+              if result.returncode == 0:
+                  report["shortcutsInstalledInSimulator"] = "com.apple.shortcuts" in json.loads(result.stdout)
+              else:
+                  report["shortcutsInstalledInSimulator"] = "unknown: simulator app list unavailable"
+          except (subprocess.SubprocessError, ValueError) as error:
+              report["shortcutsInstalledInSimulator"] = "unknown: " + type(error).__name__
+          Path(os.environ["RUNNER_TEMP"], "shortcut-host-coverage.json").write_text(json.dumps(report, indent=2))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("\nShare-extension registration and system sharing UI are checked. Shortcuts import, Back Tap and Action Button still require a physical-device test.\n")
+          print(json.dumps(report, indent=2))
+          PYTHON
+
+      - name: Shut down the simulator started by this job
+        if: always() && steps.simulator.outputs.destination != ''
+        env:
+          TEST_DESTINATION: ${{ steps.simulator.outputs.destination }}
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os, subprocess
+          udid = os.environ["TEST_DESTINATION"].split("id=", 1)[1]
+          try:
+              result = subprocess.run(["xcrun", "simctl", "shutdown", udid], timeout=60)
+              if result.returncode:
+                  print("::warning::Simulator shutdown returned a nonzero status; the device may already be stopped.")
+          except subprocess.TimeoutExpired:
+              print("::warning::Simulator cleanup timed out; the runner will dispose of the machine.")
+          PYTHON
+
+      - name: Upload validation reports even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/core-tests.log
+            ${{ runner.temp }}/ios-tests.log
+            ${{ runner.temp }}/ios-ui-tests.log
+            ${{ runner.temp }}/ios-test-build.log
+            ${{ runner.temp }}/ios-build.log
+            ${{ runner.temp }}/TestResults.xcresult
+            ${{ runner.temp }}/HostedResults.xcresult
+            ${{ runner.temp }}/TestBuild.xcresult
+            ${{ runner.temp }}/BuildResults.xcresult
+            ${{ runner.temp }}/interface-screenshots
+            ${{ runner.temp }}/hosted-screenshots
+            ${{ runner.temp }}/shortcut-verification.json
+            ${{ runner.temp }}/shortcut-package-verification.json
+            ${{ runner.temp }}/shortcut-host-coverage.json
+            ${{ runner.temp }}/share-ui-completion.json
+            ${{ runner.temp }}/processing-stages.json
+            ${{ runner.temp }}/vision-core
+            Shortcuts/TranslateScreen.unsigned.plist
+          if-no-files-found: warn
+          retention-days: 14
+
+  vision:
+    if: inputs.inspect_run_id == ''
+    name: Verify native Vision on macOS 15 Intel
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run the production recognizer on real Japanese and small text
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift test --jobs 3 --filter VisionCoreTests 2>&1 | tee "$RUNNER_TEMP/vision-core-tests.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-vision-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/vision-core-tests.log
+            ${{ runner.temp }}/vision-core
+          if-no-files-found: warn
+          retention-days: 14
+
+  ipad:
+    if: inputs.inspect_run_id == ''
+    name: Check iPad portrait and landscape
+    runs-on: ${{ inputs.runner || 'macos-26' }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Choose an available iPad simulator
+        id: simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun simctl list devices available --json > "$RUNNER_TEMP/ipad-simulators.json"
+          echo "destination=$(python3 .github/scripts/simulator-destination.py iPad < "$RUNNER_TEMP/ipad-simulators.json")" >> "$GITHUB_OUTPUT"
+      - name: Boot the selected iPad
+        timeout-minutes: 15
+        env:
+          TEST_DESTINATION: ${{ steps.simulator.outputs.destination }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          UDID="${TEST_DESTINATION##*id=}"
+          xcrun simctl bootstatus "$UDID" -b
+      - name: Test iPad layout on a real simulator
+        env:
+          TEST_DESTINATION: ${{ steps.simulator.outputs.destination }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild test -project "$PROJECT" -scheme "$SCHEME" \
+            -configuration Debug -destination "$TEST_DESTINATION" -parallel-testing-enabled NO -jobs 3 \
+            -derivedDataPath "$RUNNER_TEMP/iPadDerivedData" -resultBundlePath "$RUNNER_TEMP/iPadResults.xcresult" \
+            -only-testing:ScreenTranslateUITests/ScreenTranslateUITests/testInterfaceAdaptsToPortraitAndLandscape \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 180 -maximum-test-execution-time-allowance 600 \
+            CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="-" DEVELOPMENT_TEAM="" \
+            2>&1 | tee "$RUNNER_TEMP/ipad-tests.log"
+      - name: Export iPad screenshots
+        if: always()
+        shell: bash
+        run: |
+          if [[ -d "$RUNNER_TEMP/iPadResults.xcresult" ]]; then
+            xcrun xcresulttool export attachments --path "$RUNNER_TEMP/iPadResults.xcresult" --output-path "$RUNNER_TEMP/ipad-screenshots"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ipad-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ipad-tests.log
+            ${{ runner.temp }}/iPadResults.xcresult
+            ${{ runner.temp }}/ipad-screenshots
+            ${{ runner.temp }}/ipad-simulators.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, vision, ipad]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: TranslateScreen-${{ needs.build.outputs.version }}-unsigned
+      - name: Publish tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          IPA_NAME: ${{ needs.build.outputs.ipa_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$IPA_NAME" "$IPA_NAME.sha256" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" \
-              "$IPA_NAME" \
-              "$IPA_NAME.sha256" \
-              --verify-tag \
-              --title "Translate Screen $GITHUB_REF_NAME" \
-              --generate-notes
+            gh release create "$RELEASE_TAG" "$IPA_NAME" "$IPA_NAME.sha256" --verify-tag --generate-notes --title "AY Translate $RELEASE_TAG"
           fi
