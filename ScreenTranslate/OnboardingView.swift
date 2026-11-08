@@ -50,9 +50,9 @@ struct OnboardingView: View {
                                 .symbolEffect(.breathe, options: .repeat(.periodic(delay: 2)))
                         }
                         VStack(spacing: 14) {
-                            Text(item.title)
+                            Text(LocalizedStringKey(item.title))
                                 .font(.system(.largeTitle, design: .rounded, weight: .bold))
-                            Text(item.message)
+                            Text(LocalizedStringKey(item.message))
                                 .font(.title3)
                                 .foregroundStyle(.secondary)
                                 .multilineTextAlignment(.center)
@@ -72,7 +72,7 @@ struct OnboardingView: View {
                     completion()
                 }
             } label: {
-                Text(page == pages.count - 1 ? "Set Up Action Button" : "Continue")
+                Text(LocalizedStringKey(page == pages.count - 1 ? "Set Up Action Button" : "Continue"))
                     .font(.headline)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 16)
@@ -95,6 +95,8 @@ private struct OnboardingPage {
 struct ShortcutSetupView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
+    @State private var showsFile = false
+    @State private var importFailed = false
 
     var body: some View {
         NavigationStack {
@@ -116,9 +118,9 @@ struct ShortcutSetupView: View {
                     }
 
                     VStack(spacing: 8) {
-                        Text("Screenshot, then translate")
+                        Text(LocalizedStringKey(ShortcutInstaller.bundledFile == nil ? "Screenshot, then translate" : "Add a ready-to-use shortcut"))
                             .font(.title2.bold())
-                        Text("Create this two-action shortcut once. After that, the Action Button captures and translates the current screen automatically.")
+                        Text(LocalizedStringKey(ShortcutInstaller.bundledFile == nil ? "In Shortcuts, add the two actions shown above in that order." : "The two actions are already connected. Confirm Add Shortcut in Shortcuts, then choose it for your Action Button or Back Tap."))
                             .foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
                     }
@@ -128,30 +130,40 @@ struct ShortcutSetupView: View {
                     VStack(spacing: 0) {
                         SetupStep(
                             number: 1,
-                            title: "Create “Translate Screen”",
-                            detail: "In Shortcuts, add the two actions shown above in that order."
+                            title: ShortcutInstaller.bundledFile == nil ? "Create “AY Translate”" : "Add the prepared shortcut",
+                            detail: ShortcutInstaller.bundledFile == nil ? "In Shortcuts, add the two actions shown above in that order." : "Tap Add Screenshot Shortcut below and confirm the system import. No manual action assembly is needed."
                         )
                         Divider().padding(.leading, 58)
                         SetupStep(
                             number: 2,
                             title: "Choose it for Action Button",
-                            detail: "Open Settings › Action Button › Shortcut, then select “Translate Screen”."
+                            detail: "Open Settings › Action Button › Shortcut, then select “AY Translate”."
                         )
                     }
                     .background(.background, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
 
                     Button {
-                        if let url = URL(string: "shortcuts://create-shortcut") { openURL(url) }
+                        if !ShortcutInstaller.install() { importFailed = true }
                     } label: {
-                        Label("Create Screenshot Shortcut", systemImage: "plus")
+                        Label("Add Screenshot Shortcut", systemImage: "plus")
                             .font(.headline)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 14)
                     }
                     .buttonStyle(.borderedProminent)
                     .buttonBorderShape(.roundedRectangle(radius: 14))
+                    .disabled(ShortcutInstaller.bundledFile == nil)
 
-                    Label("No photo picker, If action, or separate Open action is needed.", systemImage: "checkmark.circle.fill")
+                    if ShortcutInstaller.bundledFile == nil {
+                        Text("Automatic import is unavailable in this build. Add the two actions shown above once in Shortcuts.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+
+                    if ShortcutInstaller.bundledFile != nil {
+                        Button("Import Bundled Shortcut File") { showsFile = true }
+                    }
+                    Button("Run Translation Shortcut") { openURL(ShortcutInstaller.runURL) }
+                    Label("The shortcut shares the screenshot with the full-screen translator above your current app. Close or swipe up to return. iOS requires confirmation before adding a shortcut and assigning a hardware trigger.", systemImage: "checkmark.circle.fill")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -165,6 +177,12 @@ struct ShortcutSetupView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
+            }
+            .alert("The bundled shortcut could not be opened.", isPresented: $importFailed) {
+                Button("OK", role: .cancel) {}
+            }
+            .sheet(isPresented: $showsFile) {
+                if let file = ShortcutInstaller.fileForImport() { ShortcutFileExport(file: file) }
             }
         }
     }
@@ -191,14 +209,14 @@ private struct ShortcutRecipeView: View {
             ShortcutActionRow(
                 icon: "character.bubble.fill",
                 color: .blue,
-                title: "Translate Screenshot",
+                title: "Share with AY Translate",
                 detail: "Screenshot"
             )
         }
         .padding(12)
         .background(Color.black.opacity(0.88), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Shortcut recipe: Take Screenshot, then Translate Screenshot")
+        .accessibilityLabel("Shortcut recipe: Take Screenshot, then Share with AY Translate")
     }
 }
 
@@ -217,10 +235,10 @@ private struct ShortcutActionRow: View {
                 .background(color.gradient, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(title)
+                Text(LocalizedStringKey(title))
                     .font(.body.weight(.semibold))
                     .foregroundStyle(.white)
-                Text(detail)
+                Text(LocalizedStringKey(detail))
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.62))
             }
@@ -247,8 +265,8 @@ private struct SetupStep: View {
                 .frame(width: 28, height: 28)
                 .background(.blue, in: Circle())
             VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.body.weight(.semibold))
-                Text(detail).font(.subheadline).foregroundStyle(.secondary)
+                Text(LocalizedStringKey(title)).font(.body.weight(.semibold))
+                Text(LocalizedStringKey(detail)).font(.subheadline).foregroundStyle(.secondary)
             }
             Spacer()
         }
